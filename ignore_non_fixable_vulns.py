@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Create Snyk project ignores for vulnerabilities that currently have no fix.
+Create Snyk project ignores for vulnerabilities that have no supported fix.
 
-Uses the V1 API ignore flag ``disregardIfFixable``. Discovers projects via the
-REST API (org scope or group → orgs), tracks work in a CSV, and supports resume.
+Sources issues from the REST Export API (``issues`` dataset) and treats an
+issue as non-fixable when its ``computed_fixability`` column is
+``No Fix Supported`` *and* ``fixed_in_available`` is false — the pairing that
+matches what Snyk's ignore logic considers unfixable. Ignores are created with
+the V1 API flag
+``disregardIfFixable`` so they lapse once a fix appears. Work is tracked in a
+CSV so an interrupted run can resume.
 
 Author: Torsten Cannell, torsten.cannell@snyk.io
 Revision History:
@@ -16,32 +21,100 @@ Revision History:
 - 2026-05-06: Merge V1 /org/.../dependencies project discovery; JSON:API included; Link regex.
 - 2026-07-17: Single SNYK_API_BASE_URL host; append /v1 or /rest per endpoint.
 - 2026-07-17: Treat empty optional env vars as unset (GitHub Actions passes "").
+- 2026-09-09: Replace project/aggregated-issues discovery with the Export API;
+  define non-fixable as computed_fixability == "No Supported Fix".
+- 2026-09-09: Add --report-csv for a reviewable list of the matched issues.
+- 2026-09-09: Match "No Fix Supported" (the value the Export API actually
+  emits; the docs say "No Supported Fix") and report label tallies on a miss.
+- 2026-09-09: Also require fixed_in_available to be false, so the selection
+  matches what disregardIfFixable treats as unfixable; classify ignore
+  conflicts by HTTP status instead of substring-matching "409".
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
+import gzip
 import io
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 DEFAULT_API_HOST = "https://api.snyk.io"
 DEFAULT_REST_VERSION = "2024-10-15"
 DEFAULT_REASON = "No fix available"
 DEFAULT_STATE_CSV = "ignore_non_fixable_progress.csv"
 
+# The Export API requires at least one date filter; this default is early
+# enough to cover every issue Snyk holds.
+DEFAULT_INTRODUCED_FROM = "2010-01-01T00:00:00Z"
+# The Export API emits "No Fix Supported"; Snyk's docs write the same value as
+# "No Supported Fix". Accept both so a wording change on either side does not
+# silently match zero rows.
+DEFAULT_FIXABILITY = ("No Fix Supported", "No Supported Fix")
+DEFAULT_ISSUE_TYPE = "Vulnerability"
+DEFAULT_ISSUE_STATUS = "Open"
+DEFAULT_POLL_SECONDS = 15
+DEFAULT_EXPORT_TIMEOUT_SECONDS = 3600
+
+# The columns needed to build an ignore, the columns filtered on, and enough
+# human-readable context for --report-csv to be reviewable without lookups.
+EXPORT_COLUMNS = (
+    "GROUP_PUBLIC_ID",
+    "ORG_PUBLIC_ID",
+    "PROJECT_PUBLIC_ID",
+    "PROBLEM_ID",
+    "ISSUE_TYPE",
+    "ISSUE_STATUS",
+    "COMPUTED_FIXABILITY",
+    "FIXED_IN_AVAILABLE",
+    "FIXED_IN_VERSION",
+    "PROBLEM_TITLE",
+    "ISSUE_SEVERITY",
+    "PROJECT_NAME",
+    "PACKAGE_NAME_AND_VERSION",
+    "ISSUE_URL",
+)
+
+TRUTHY_LABELS = frozenset({"true", "yes", "1"})
+FALSEY_LABELS = frozenset({"false", "no", "0"})
+
+TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
 CSV_COLUMNS = ("group_id", "org_id", "project_id", "issue_id", "status")
 STATUS_PENDING = "PENDING"
 STATUS_IGNORED = "IGNORED"
+
+# Kept separate from CSV_COLUMNS: load_state_csv validates the state header
+# exactly, so widening that file would reject every existing progress CSV.
+REPORT_COLUMNS = (
+    "scope_kind",
+    "scope_id",
+    "group_id",
+    "org_id",
+    "project_id",
+    "project_name",
+    "issue_id",
+    "problem_title",
+    "package_name_and_version",
+    "issue_severity",
+    "issue_type",
+    "issue_status",
+    "computed_fixability",
+    "fixed_in_available",
+    "fixed_in_version",
+    "issue_url",
+)
 
 
 def env_or_default(key: str, default: str) -> str:
@@ -74,15 +147,65 @@ def resolve_snyk_api_bases(raw: str) -> tuple[str, str]:
     return f"{host}/v1", f"{host}/rest"
 
 
-def build_headers(token: str, *, send_json: bool) -> dict[str, str]:
-    """Return HTTP headers for Snyk API requests."""
-    h: dict[str, str] = {
-        "Authorization": f"token {token}",
-        "Accept": "application/json",
-    }
-    if send_json:
-        h["Content-Type"] = "application/json"
-    return h
+def normalize_label(value: str) -> str:
+    """
+    Fold a display label to a comparable form.
+
+    Case and separators only (``No Fix Supported`` == ``no_fix_supported``);
+    word order still has to match.
+    """
+    return re.sub(r"[\s_\-]+", " ", value.strip().lower())
+
+
+def parse_bool_label(value: str) -> bool | None:
+    """
+    Interpret a boolean column from the export CSV.
+
+    Returns None for a blank or unrecognised value so callers can treat
+    "unknown" differently from "false" rather than guessing.
+    """
+    token = normalize_label(value)
+    if token in TRUTHY_LABELS:
+        return True
+    if token in FALSEY_LABELS:
+        return False
+    return None
+
+
+class SnykApiError(RuntimeError):
+    """
+    An HTTP error from the Snyk API, with the status code preserved.
+
+    Subclasses RuntimeError so existing handlers still catch it; the status is
+    kept so callers can branch on the code instead of grepping the message.
+    """
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+
+
+def describe_http_error(exc: urllib.error.HTTPError) -> str:
+    """Return the most useful human-readable text from an error response."""
+    detail = exc.read().decode(errors="replace")
+    try:
+        parsed = json.loads(detail)
+    except json.JSONDecodeError:
+        return detail or str(exc)
+    if isinstance(parsed, dict):
+        errors = parsed.get("errors")
+        if isinstance(errors, list) and errors:
+            parts = []
+            for err in errors:
+                if not isinstance(err, dict):
+                    continue
+                text = err.get("detail") or err.get("title")
+                if text:
+                    parts.append(str(text))
+            if parts:
+                return "; ".join(parts)
+        return str(parsed.get("message") or parsed.get("error") or parsed)
+    return str(parsed)
 
 
 def request_json(
@@ -91,207 +214,300 @@ def request_json(
     token: str,
     body: dict[str, Any] | None = None,
 ) -> Any:
-    """Perform an HTTP request with optional JSON body and parse JSON response."""
+    """Perform a V1 API request with optional JSON body and parse the response."""
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers=build_headers(token, send_json=body is not None),
-        method=method,
-    )
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/json",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             raw = resp.read().decode()
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()
-        try:
-            parsed = json.loads(detail)
-            if isinstance(parsed, dict):
-                msg = parsed.get("message") or parsed.get("error") or parsed
-            else:
-                msg = parsed
-        except json.JSONDecodeError:
-            msg = detail or str(exc)
-        raise RuntimeError(f"HTTP {exc.code}: {msg}") from exc
+        raise SnykApiError(exc.code, describe_http_error(exc)) from exc
 
 
-REST_PROJECTS_PAGE_LIMIT = 100
-
-
-def request_rest_get(url: str, token: str) -> tuple[Any, str | None]:
-    """
-    GET a Snyk REST (JSON:API) URL.
-
-    Uses ``Accept: application/vnd.api+json`` as required for REST contracts.
-    Returns the parsed JSON body and the raw HTTP ``Link`` header (if any).
-    """
-    req = urllib.request.Request(
-        url,
-        method="GET",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.api+json",
-        },
-    )
+def request_rest(
+    method: str,
+    url: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+) -> Any:
+    """Perform a Snyk REST (JSON:API) request and parse the response."""
+    data = None if body is None else json.dumps(body).encode()
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.api+json",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/vnd.api+json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             raw = resp.read().decode()
-            link_hdr = resp.headers.get("Link")
-            return (json.loads(raw) if raw else None, link_hdr)
+            return json.loads(raw) if raw else None
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()
-        try:
-            parsed = json.loads(detail)
-            if isinstance(parsed, dict):
-                msg = parsed.get("message") or parsed.get("error") or parsed
-            else:
-                msg = parsed
-        except json.JSONDecodeError:
-            msg = detail or str(exc)
-        raise RuntimeError(f"HTTP {exc.code}: {msg}") from exc
+        raise SnykApiError(exc.code, describe_http_error(exc)) from exc
 
 
-def parse_http_link_header_next(link_header: str | None) -> str | None:
-    """Extract URL for ``rel=next`` from an RFC 5988 ``Link`` header."""
-    if not link_header or not link_header.strip():
-        return None
-    m = re.search(
-        r"<([^>]+)>\s*;\s*rel\s*=\s*(?:\"next\"|'next'|next)\b",
-        link_header,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(1).strip()
-    for chunk in link_header.split(","):
-        chunk = chunk.strip()
-        if "rel=" not in chunk.lower():
-            continue
-        if "next" not in chunk.lower():
-            continue
-        lt = chunk.find("<")
-        gt = chunk.find(">", lt + 1)
-        if lt >= 0 and gt > lt:
-            return chunk[lt + 1 : gt].strip()
-    return None
+def scope_path_segment(scope_kind: str) -> str:
+    """Return the REST path segment for a ``group`` or ``org`` scope."""
+    return "groups" if scope_kind == "group" else "orgs"
 
 
-def encode_project_starting_after_cursor(last_project_id: str) -> str:
-    """Build Snyk cursor token for ``starting_after`` (matches API examples)."""
-    payload = json.dumps({"id": last_project_id})
-    b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-    return f"v1.{b64}"
-
-
-# V1 dependency listing: broad language list so every ecosystem contributes projects.
-DEP_FILTERS_ALL_LANGUAGES = [
-    "cpp",
-    "dockerfile",
-    "dotnet",
-    "elixir",
-    "golang",
-    "helm",
-    "java",
-    "javascript",
-    "kubernetes",
-    "linux",
-    "php",
-    "python",
-    "ruby",
-    "scala",
-    "swift-objective-c",
-    "terraform",
-]
-
-
-def list_org_projects_from_dependencies_v1(
-    api_base: str,
-    org_id: str,
+def start_export(
+    rest_base: str,
+    rest_version: str,
+    scope_kind: str,
+    scope_id: str,
     token: str,
-) -> list[str]:
-    """
-    Enumerate project IDs by paging through ``POST /org/{{orgId}}/dependencies``.
-
-    Each dependency row lists ``projects`` that use it; the union covers the org
-    even when REST ``/orgs/.../projects`` returns an incomplete list.
-    """
-    found: set[str] = set()
-    page = 1
-    per_page = 100
-    max_pages = 10000
-    use_full_filters = False
-
-    while page <= max_pages:
-        qs = urllib.parse.urlencode({"page": page, "perPage": per_page})
-        url = f"{api_base.rstrip('/')}/org/{org_id}/dependencies?{qs}"
-        if use_full_filters:
-            body: dict[str, Any] = {
-                "filters": {
-                    "depStatus": "any",
-                    "languages": list(DEP_FILTERS_ALL_LANGUAGES),
-                }
-            }
-        else:
-            body = {"filters": {"depStatus": "any"}}
-        try:
-            data = request_json("POST", url, token, body)
-        except RuntimeError:
-            if not use_full_filters:
-                use_full_filters = True
-                continue
-            raise
-        rows = data.get("results") if isinstance(data, dict) else None
-        if not isinstance(rows, list) or not rows:
-            break
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            for proj in row.get("projects") or []:
-                if isinstance(proj, dict) and proj.get("id"):
-                    found.add(str(proj["id"]))
-        if len(rows) < per_page:
-            break
-        page += 1
-
-    return sorted(found)
-
-
-def fetch_aggregated_issues(
-    api_base: str,
-    org_id: str,
-    project_id: str,
-    token: str,
-) -> list[dict[str, Any]]:
-    """Return current aggregated issues for a project (POST body)."""
-    url = f"{api_base}/org/{org_id}/project/{project_id}/aggregated-issues"
-    body: dict[str, Any] = {
-        "includeDescription": False,
-        "includeIntroducedThrough": False,
-        "filters": {
-            "ignored": False,
-            "types": ["vuln"],
-        },
-    }
-    data = request_json("POST", url, token, body)
-    if not data or "issues" not in data:
-        return []
-    return data["issues"]
-
-
-def should_ignore_issue(
-    issue: dict[str, Any],
     *,
-    require_not_partially_fixable: bool,
-) -> bool:
-    """Return True if this issue qualifies as non-fixable for this workflow."""
-    fix_info = issue.get("fixInfo")
-    if not isinstance(fix_info, dict):
-        return False
-    if fix_info.get("isFixable") is True:
-        return False
-    if require_not_partially_fixable and fix_info.get("isPartiallyFixable") is True:
-        return False
-    return True
+    filters: dict[str, Any],
+) -> str:
+    """Start an ``issues`` CSV export and return the export job ID."""
+    qs = urllib.parse.urlencode({"version": rest_version})
+    url = (
+        f"{rest_base}/{scope_path_segment(scope_kind)}/{scope_id}/export?{qs}"
+    )
+    body = {
+        "data": {
+            "type": "resource",
+            "attributes": {
+                "dataset": "issues",
+                "formats": ["csv"],
+                "columns": list(EXPORT_COLUMNS),
+                "filters": filters,
+            },
+        }
+    }
+    data = request_rest("POST", url, token, body)
+    export_id = ((data or {}).get("data") or {}).get("id")
+    if not export_id:
+        raise RuntimeError(f"Export API did not return an export id: {data!r}")
+    return str(export_id)
+
+
+def wait_for_export(
+    rest_base: str,
+    rest_version: str,
+    scope_kind: str,
+    scope_id: str,
+    export_id: str,
+    token: str,
+    *,
+    poll_seconds: int,
+    timeout_seconds: int,
+    quiet: bool,
+) -> None:
+    """Poll the export job until it reaches FINISHED, or raise."""
+    qs = urllib.parse.urlencode({"version": rest_version})
+    url = (
+        f"{rest_base}/{scope_path_segment(scope_kind)}/{scope_id}"
+        f"/jobs/export/{export_id}?{qs}"
+    )
+    deadline = time.monotonic() + timeout_seconds
+    last_status = ""
+    while True:
+        data = request_rest("GET", url, token)
+        attrs = ((data or {}).get("data") or {}).get("attributes") or {}
+        status = str(attrs.get("status") or "").upper()
+        if status == "FINISHED":
+            return
+        if status.startswith("ERROR"):
+            raise RuntimeError(f"Export {export_id} finished with status {status}.")
+        if not quiet and status and status != last_status:
+            print(f"  export {export_id}: {status}")
+            last_status = status
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Export {export_id} did not finish within {timeout_seconds}s "
+                f"(last status: {status or 'unknown'})."
+            )
+        time.sleep(poll_seconds)
+
+
+def fetch_export_result_urls(
+    rest_base: str,
+    rest_version: str,
+    scope_kind: str,
+    scope_id: str,
+    export_id: str,
+    token: str,
+) -> tuple[list[str], int]:
+    """Return the signed CSV download URLs and the reported row count."""
+    qs = urllib.parse.urlencode({"version": rest_version})
+    url = (
+        f"{rest_base}/{scope_path_segment(scope_kind)}/{scope_id}"
+        f"/export/{export_id}?{qs}"
+    )
+    data = request_rest("GET", url, token)
+    attrs = ((data or {}).get("data") or {}).get("attributes") or {}
+    row_count = attrs.get("row_count")
+    urls: list[str] = []
+    for item in attrs.get("results") or []:
+        if isinstance(item, str) and item.startswith(("http://", "https://")):
+            urls.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("url", "href", "location", "signed_url"):
+            candidate = item.get(key)
+            if isinstance(candidate, str) and candidate.startswith(
+                ("http://", "https://")
+            ):
+                urls.append(candidate)
+                break
+    return urls, int(row_count or 0)
+
+
+def iter_export_csv(url: str) -> Iterator[dict[str, str]]:
+    """
+    Stream one exported CSV file as dicts keyed by lower-cased column name.
+
+    The URL is pre-signed by object storage, so no Authorization header is sent.
+    """
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        path = urllib.parse.urlparse(url).path.lower()
+        gzipped = (
+            resp.headers.get("Content-Encoding", "").lower() == "gzip"
+            or path.endswith(".gz")
+        )
+        binary = gzip.GzipFile(fileobj=resp) if gzipped else resp
+        text = io.TextIOWrapper(
+            binary, encoding="utf-8-sig", errors="replace", newline=""
+        )
+        for raw in csv.DictReader(text):
+            yield {
+                key.strip().lower(): (value or "").strip()
+                for key, value in raw.items()
+                if key
+            }
+
+
+class ExportMatch(NamedTuple):
+    """
+    What one scope's export yielded.
+
+    ``state_rows`` and ``report_rows`` are kept apart because state rows
+    round-trip through the narrow state CSV while report rows carry the
+    descriptive columns used only for review. The tallies cover every exported
+    row and exist to explain a zero-match run.
+    """
+
+    state_rows: list[dict[str, str]]
+    report_rows: list[dict[str, str]]
+    fixability_seen: Counter[str]
+    issue_type_seen: Counter[str]
+    fixed_in_available_seen: Counter[str]
+
+
+def format_label_counts(counts: Counter[str]) -> str:
+    """Render a label tally as ``Fixable=41, Partially Fixable=17``."""
+    if not counts:
+        return "(none)"
+    return ", ".join(
+        f"{label or '(blank)'}={n}" for label, n in counts.most_common()
+    )
+
+
+def collect_rows_from_export(
+    urls: list[str],
+    *,
+    scope_kind: str,
+    scope_id: str,
+    fixability: set[str],
+    issue_types: set[str],
+    issue_statuses: set[str],
+    project_filter: set[str] | None,
+    require_unfixed_upstream: bool,
+) -> ExportMatch:
+    """Filter exported issue rows down to non-fixable vulns."""
+    seen: set[tuple[str, str, str]] = set()
+    rows: list[dict[str, str]] = []
+    report_rows: list[dict[str, str]] = []
+    fixability_seen: Counter[str] = Counter()
+    issue_type_seen: Counter[str] = Counter()
+    fixed_in_available_seen: Counter[str] = Counter()
+    for url in urls:
+        for record in iter_export_csv(url):
+            fixability_seen[record.get("computed_fixability", "")] += 1
+            issue_type_seen[record.get("issue_type", "")] += 1
+            fixed_in_available_seen[record.get("fixed_in_available", "")] += 1
+            if normalize_label(record.get("computed_fixability", "")) not in fixability:
+                continue
+            # An upstream fixed version means Snyk may still find an upgrade
+            # path and disregard the ignore, so require it to be absent. A
+            # blank or unrecognised value is treated as unknown, not false.
+            if require_unfixed_upstream:
+                if parse_bool_label(record.get("fixed_in_available", "")) is not False:
+                    continue
+            if (
+                issue_types
+                and normalize_label(record.get("issue_type", "")) not in issue_types
+            ):
+                continue
+            if (
+                issue_statuses
+                and normalize_label(record.get("issue_status", "")) not in issue_statuses
+            ):
+                continue
+            org_id = record.get("org_public_id", "")
+            project_id = record.get("project_public_id", "")
+            issue_id = record.get("problem_id", "")
+            if not (org_id and project_id and issue_id):
+                continue
+            if project_filter is not None and project_id not in project_filter:
+                continue
+            key = (org_id, project_id, issue_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            group_id = record.get("group_public_id", "")
+            if not group_id and scope_kind == "group":
+                group_id = scope_id
+            rows.append(
+                {
+                    "group_id": group_id,
+                    "org_id": org_id,
+                    "project_id": project_id,
+                    "issue_id": issue_id,
+                    "status": STATUS_PENDING,
+                }
+            )
+            report_rows.append(
+                {
+                    "scope_kind": scope_kind,
+                    "scope_id": scope_id,
+                    "group_id": group_id,
+                    "org_id": org_id,
+                    "project_id": project_id,
+                    "project_name": record.get("project_name", ""),
+                    "issue_id": issue_id,
+                    "problem_title": record.get("problem_title", ""),
+                    "package_name_and_version": record.get(
+                        "package_name_and_version", ""
+                    ),
+                    "issue_severity": record.get("issue_severity", ""),
+                    "issue_type": record.get("issue_type", ""),
+                    "issue_status": record.get("issue_status", ""),
+                    "computed_fixability": record.get("computed_fixability", ""),
+                    "fixed_in_available": record.get("fixed_in_available", ""),
+                    "fixed_in_version": record.get("fixed_in_version", ""),
+                    "issue_url": record.get("issue_url", ""),
+                }
+            )
+    return ExportMatch(
+        rows,
+        report_rows,
+        fixability_seen,
+        issue_type_seen,
+        fixed_in_available_seen,
+    )
 
 
 def add_ignore(
@@ -318,147 +534,6 @@ def add_ignore(
     if expires is not None and expires.strip():
         payload["expires"] = expires.strip()
     return request_json("POST", url, token, payload)
-
-
-def fetch_group_orgs_v1(
-    api_base: str,
-    group_id: str,
-    token: str,
-) -> list[dict[str, Any]]:
-    """Return all organizations in a group (V1, paginated)."""
-    all_orgs: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        qs = urllib.parse.urlencode({"page": page, "perPage": 100})
-        url = f"{api_base}/group/{group_id}/orgs?{qs}"
-        data = request_json("GET", url, token, None)
-        orgs = data.get("orgs") if isinstance(data, dict) else None
-        if not orgs:
-            break
-        all_orgs.extend(orgs)
-        if len(orgs) < 100:
-            break
-        page += 1
-    return all_orgs
-
-
-def normalize_rest_next_url(raw: Any, rest_base: str) -> str | None:
-    """
-    Resolve JSON:API LinkProperty for pagination.
-
-    Snyk REST returns ``links.next`` as either a URL string or an object
-    ``{\"href\": \"...\"}``. Treating non-strings as absent broke pagination
-    after the first page (often showing only one project).
-    """
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        href = raw.strip()
-    elif isinstance(raw, dict):
-        h = raw.get("href")
-        if not isinstance(h, str):
-            return None
-        href = h.strip()
-    else:
-        return None
-    if not href:
-        return None
-    if href.startswith(("http://", "https://")):
-        return href
-    base = rest_base.rstrip("/") + "/"
-    return urllib.parse.urljoin(base, href)
-
-
-def list_org_projects_rest(
-    rest_base: str,
-    rest_version: str,
-    org_id: str,
-    token: str,
-) -> list[str]:
-    """List all project IDs for an org via REST API (paginated)."""
-    found: set[str] = set()
-    qs = urllib.parse.urlencode(
-        {"version": rest_version, "limit": str(REST_PROJECTS_PAGE_LIMIT)}
-    )
-    url: str | None = f"{rest_base.rstrip('/')}/orgs/{org_id}/projects?{qs}"
-    seen_fallback_cursors: set[str] = set()
-    pages = 0
-    max_pages = 5000
-
-    while url and pages < max_pages:
-        pages += 1
-        try:
-            data, link_hdr = request_rest_get(url, token)
-        except RuntimeError:
-            if pages > 1 and "starting_after" in url:
-                break
-            raise
-        batch = data.get("data") if isinstance(data, dict) else None
-        if not isinstance(batch, list):
-            batch = []
-
-        for item in batch:
-            if isinstance(item, dict) and item.get("id"):
-                found.add(str(item["id"]))
-
-        included = data.get("included") if isinstance(data, dict) else None
-        if isinstance(included, list):
-            for item in included:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") != "project":
-                    continue
-                iid = item.get("id")
-                if iid:
-                    found.add(str(iid))
-
-        links_obj = data.get("links") if isinstance(data.get("links"), dict) else {}
-        next_url = normalize_rest_next_url(links_obj.get("next"), rest_base)
-        if not next_url:
-            next_url = parse_http_link_header_next(link_hdr)
-
-        if (
-            not next_url
-            and len(batch) >= REST_PROJECTS_PAGE_LIMIT
-            and batch
-        ):
-            last_id = batch[-1].get("id") if isinstance(batch[-1], dict) else None
-            if isinstance(last_id, str):
-                cursor = encode_project_starting_after_cursor(last_id)
-                if cursor not in seen_fallback_cursors:
-                    seen_fallback_cursors.add(cursor)
-                    fq = urllib.parse.urlencode(
-                        {
-                            "version": rest_version,
-                            "limit": str(REST_PROJECTS_PAGE_LIMIT),
-                            "starting_after": cursor,
-                        }
-                    )
-                    next_url = (
-                        f"{rest_base.rstrip('/')}/orgs/{org_id}/projects?{fq}"
-                    )
-
-        url = next_url
-
-    return sorted(found)
-
-
-def list_org_project_ids_for_org(
-    api_base: str,
-    rest_base: str,
-    rest_version: str,
-    org_id: str,
-    token: str,
-    *,
-    discover_projects: str,
-) -> list[str]:
-    """Union project IDs from REST listing and/or V1 dependency graph."""
-    merged: set[str] = set()
-    if discover_projects in ("rest", "both"):
-        merged.update(list_org_projects_rest(rest_base, rest_version, org_id, token))
-    if discover_projects in ("dependencies", "both"):
-        merged.update(list_org_projects_from_dependencies_v1(api_base, org_id, token))
-    return sorted(merged)
 
 
 def row_key(row: dict[str, str]) -> tuple[str, str, str]:
@@ -497,6 +572,21 @@ def save_state_csv(path: Path, rows: list[dict[str, str]]) -> None:
     tmp.replace(path)
 
 
+def save_report_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    """Write the reviewable report of every issue the export matched."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(REPORT_COLUMNS))
+        writer.writeheader()
+        for row in sorted(
+            rows,
+            key=lambda r: (r["org_id"], r["project_id"], r["issue_id"]),
+        ):
+            writer.writerow({k: row.get(k, "") for k in REPORT_COLUMNS})
+    tmp.replace(path)
+
+
 def merge_pending_rows(
     existing: list[dict[str, str]],
     new_rows: list[dict[str, str]],
@@ -524,9 +614,10 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Discover non-fixable vulns across Snyk org(s) or group(s), record "
-            "them in a CSV, create ignores with disregardIfFixable, and resume "
-            "from the CSV if interrupted."
+            "Export Snyk issues, keep the ones whose computed_fixability is "
+            "'No Fix Supported' and whose fixed_in_available is false, record "
+            "them in a CSV, create ignores with disregardIfFixable, and "
+            "resume from the CSV if interrupted."
         )
     )
     parser.add_argument(
@@ -534,14 +625,14 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="UUID",
-        help="Snyk Group ID (repeatable). Fetches orgs via V1 /group/{id}/orgs.",
+        help="Snyk Group ID (repeatable). One group-scoped export per ID.",
     )
     parser.add_argument(
         "--org-id",
         action="append",
         default=[],
         metavar="UUID",
-        help="Snyk Organization ID (repeatable). Combined with --group-id results.",
+        help="Snyk Organization ID (repeatable). One org-scoped export per ID.",
     )
     parser.add_argument(
         "--project-id",
@@ -549,16 +640,13 @@ def parse_args() -> argparse.Namespace:
         dest="project_filter",
         default=None,
         metavar="UUID",
-        help=(
-            "If set, only consider these project IDs per org (intersect with "
-            "REST listing). Repeatable."
-        ),
+        help="If set, keep only these project IDs from the export. Repeatable.",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
         help=(
-            "Skip discovery; only process PENDING rows in the state CSV "
+            "Skip the export; only process PENDING rows in the state CSV "
             "(use after an interrupted run)."
         ),
     )
@@ -573,6 +661,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--report-csv",
+        default=env_or_default("SNYK_REPORT_CSV", ""),
+        metavar="PATH",
+        help=(
+            "Also write a reviewable CSV of every matched issue (project name, "
+            "package, severity, title, fixability, issue URL). Written right "
+            "after the export, so it lists candidates rather than outcomes; "
+            "the state CSV remains the record of PENDING vs IGNORED. Ignored "
+            "with --resume, which runs no export."
+        ),
+    )
+    parser.add_argument(
         "--api-base-url",
         default=env_or_default("SNYK_API_BASE_URL", DEFAULT_API_HOST),
         help=(
@@ -583,17 +683,92 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rest-version",
         default=env_or_default("SNYK_REST_VERSION", DEFAULT_REST_VERSION),
-        help="REST API version query param for /orgs/.../projects.",
+        help="REST API version query param for the Export API.",
     )
     parser.add_argument(
-        "--discover-projects",
-        choices=("rest", "dependencies", "both"),
-        default="both",
+        "--introduced-from",
+        default=env_or_default("SNYK_INTRODUCED_FROM", DEFAULT_INTRODUCED_FROM),
+        metavar="YYYY-MM-DDTHH:MM:SSZ",
         help=(
-            "How to enumerate projects: REST /orgs/.../projects, V1 "
-            "/org/.../dependencies (union of projects per dependency), or "
-            "both merged (default)."
+            "Export filter: earliest issue introduction date (default: "
+            "%(default)s). The Export API requires at least one date filter."
         ),
+    )
+    parser.add_argument(
+        "--introduced-to",
+        default=env_or_default("SNYK_INTRODUCED_TO", ""),
+        metavar="YYYY-MM-DDTHH:MM:SSZ",
+        help="Export filter: latest issue introduction date (optional).",
+    )
+    parser.add_argument(
+        "--updated-from",
+        default=env_or_default("SNYK_UPDATED_FROM", ""),
+        metavar="YYYY-MM-DDTHH:MM:SSZ",
+        help=(
+            "Export filter: only issues updated since this time. Setting this "
+            "drops the default --introduced-from window so incremental runs "
+            "are not also bounded by introduction date."
+        ),
+    )
+    parser.add_argument(
+        "--updated-to",
+        default=env_or_default("SNYK_UPDATED_TO", ""),
+        metavar="YYYY-MM-DDTHH:MM:SSZ",
+        help="Export filter: only issues updated before this time (optional).",
+    )
+    parser.add_argument(
+        "--fixability",
+        action="append",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "computed_fixability value treated as non-fixable (repeatable, "
+            f"case-insensitive; default: {' or '.join(DEFAULT_FIXABILITY)}). "
+            "Use 'Partially Fixable' to widen the scope."
+        ),
+    )
+    parser.add_argument(
+        "--include-fixed-in-available",
+        action="store_true",
+        help=(
+            "Also keep issues where fixed_in_available is true (a fixed "
+            "version exists upstream but Snyk reports no supported fix). Snyk "
+            "may still find an upgrade path for these and disregard the "
+            "ignore. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--issue-type",
+        action="append",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "issue_type value to keep (repeatable, case-insensitive; default: "
+            f"{DEFAULT_ISSUE_TYPE}). Pass an empty string to keep all types."
+        ),
+    )
+    parser.add_argument(
+        "--issue-status",
+        action="append",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "issue_status to export and keep (repeatable; default: "
+            f"{DEFAULT_ISSUE_STATUS}). Valid values: Open, Resolved, Ignored."
+        ),
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=DEFAULT_POLL_SECONDS,
+        help="Seconds between export status checks (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--export-timeout",
+        type=int,
+        default=DEFAULT_EXPORT_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help="Give up on an export job after this long (default: %(default)s).",
     )
     parser.add_argument(
         "--reason",
@@ -623,16 +798,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional calendar expiry (ISO 8601). Omitted by default.",
     )
     parser.add_argument(
-        "--include-partially-fixable",
-        action="store_true",
-        help="Include issues where isPartiallyFixable is true.",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
-            "Do not call ignore API or mark rows IGNORED. Discovery still writes "
-            "PENDING rows to the state CSV."
+            "Do not call the ignore API or mark rows IGNORED. The export still "
+            "runs and writes PENDING rows to the state CSV."
         ),
     )
     parser.add_argument(
@@ -654,94 +824,135 @@ def env_extend_ids(cli_list: list[str], env_single: str, env_plural: str) -> lis
     return out
 
 
-def build_org_to_group(
-    api_base: str,
-    group_ids: list[str],
-    org_ids: list[str],
-    token: str,
-) -> dict[str, str]:
+def label_set(
+    values: list[str] | None,
+    default: str | tuple[str, ...],
+) -> set[str]:
     """
-    Map org_id -> group_id (empty string when org was listed only via --org-id).
+    Normalize repeatable label options.
 
-    Orgs from multiple groups: first group wins for that org id.
+    A default may list several accepted spellings. An explicit empty value on
+    the command line disables the filter entirely.
     """
-    org_to_group: dict[str, str] = {}
-    for gid in group_ids:
-        for org in fetch_group_orgs_v1(api_base, gid, token):
-            oid = org.get("id")
-            if not oid:
+    if values is None:
+        defaults = (default,) if isinstance(default, str) else default
+        return {normalize_label(v) for v in defaults}
+    return {normalize_label(v) for v in values if v.strip()}
+
+
+def build_date_filters(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the Export API ``introduced`` / ``updated`` filters from CLI options."""
+    introduced_from = args.introduced_from
+    # The two windows are ANDed, so the catch-all introduced default would
+    # otherwise tag along and muddy an explicitly requested updated window.
+    if (args.updated_from or args.updated_to) and not args.introduced_to:
+        if introduced_from.strip() == DEFAULT_INTRODUCED_FROM:
+            introduced_from = ""
+
+    filters: dict[str, Any] = {}
+    for name, lower, upper in (
+        ("introduced", introduced_from, args.introduced_to),
+        ("updated", args.updated_from, args.updated_to),
+    ):
+        window = {}
+        for bound, raw in (("from", lower), ("to", upper)):
+            value = (raw or "").strip()
+            if not value:
                 continue
-            if oid not in org_to_group:
-                org_to_group[oid] = gid
-    for oid in org_ids:
-        if oid not in org_to_group:
-            org_to_group[oid] = ""
-    return org_to_group
+            if not TIMESTAMP_RE.match(value):
+                raise ValueError(
+                    f"--{name}-{bound} must look like YYYY-MM-DDTHH:MM:SSZ "
+                    f"(got {value!r})"
+                )
+            window[bound] = value
+        if window:
+            filters[name] = window
+    if not filters:
+        raise ValueError(
+            "The Export API requires at least one date filter: set "
+            "--introduced-from/--introduced-to or --updated-from/--updated-to."
+        )
+    return filters
 
 
-def discover_rows(
+def run_exports(
     *,
-    api_base: str,
     rest_base: str,
     rest_version: str,
-    org_to_group: dict[str, str],
-    project_filter: set[str] | None,
+    scopes: list[tuple[str, str]],
+    filters: dict[str, Any],
     token: str,
-    require_not_partial: bool,
+    fixability: set[str],
+    issue_types: set[str],
+    issue_statuses: set[str],
+    project_filter: set[str] | None,
+    require_unfixed_upstream: bool,
+    poll_seconds: int,
+    export_timeout: int,
     quiet: bool,
-    discover_projects: str,
-) -> list[dict[str, str]]:
-    """Scan projects and issues; return new PENDING rows."""
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Run one export per scope and return (new PENDING rows, report rows)."""
     new_rows: list[dict[str, str]] = []
-    for org_id, gid in sorted(org_to_group.items(), key=lambda x: x[0]):
-        try:
-            proj_ids = list_org_project_ids_for_org(
-                api_base,
-                rest_base,
-                rest_version,
-                org_id,
-                token,
-                discover_projects=discover_projects,
-            )
-        except RuntimeError as exc:
-            print(f"[{org_id}] Failed to list projects: {exc}", file=sys.stderr)
-            raise
-        if project_filter is not None:
-            proj_ids = [p for p in proj_ids if p in project_filter]
-        if not proj_ids and not quiet:
-            print(f"Org {org_id}: no projects (after filter).")
-            continue
+    report_rows: list[dict[str, str]] = []
+    for scope_kind, scope_id in scopes:
         if not quiet:
-            print(f"Org {org_id}: scanning {len(proj_ids)} project(s).")
-
-        for project_id in proj_ids:
-            try:
-                issues = fetch_aggregated_issues(api_base, org_id, project_id, token)
-            except RuntimeError as exc:
+            print(f"{scope_kind.capitalize()} {scope_id}: starting export.")
+        export_id = start_export(
+            rest_base, rest_version, scope_kind, scope_id, token, filters=filters
+        )
+        wait_for_export(
+            rest_base,
+            rest_version,
+            scope_kind,
+            scope_id,
+            export_id,
+            token,
+            poll_seconds=poll_seconds,
+            timeout_seconds=export_timeout,
+            quiet=quiet,
+        )
+        urls, row_count = fetch_export_result_urls(
+            rest_base, rest_version, scope_kind, scope_id, export_id, token
+        )
+        if not quiet:
+            print(
+                f"{scope_kind.capitalize()} {scope_id}: export {export_id} "
+                f"ready ({row_count} row(s) in {len(urls)} file(s))."
+            )
+        if not urls:
+            continue
+        match = collect_rows_from_export(
+            urls,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+            fixability=fixability,
+            issue_types=issue_types,
+            issue_statuses=issue_statuses,
+            project_filter=project_filter,
+            require_unfixed_upstream=require_unfixed_upstream,
+        )
+        if not quiet:
+            print(
+                f"{scope_kind.capitalize()} {scope_id}: "
+                f"{len(match.state_rows)} non-fixable issue(s) matched."
+            )
+            if not match.state_rows:
+                # A label the filters do not recognise looks identical to an
+                # empty result, so show what the export actually contained.
                 print(
-                    f"[{org_id}/{project_id}] Failed to list issues: {exc}",
-                    file=sys.stderr,
+                    "  computed_fixability seen: "
+                    f"{format_label_counts(match.fixability_seen)}"
                 )
-                raise
-            for issue in issues:
-                if not should_ignore_issue(
-                    issue,
-                    require_not_partially_fixable=require_not_partial,
-                ):
-                    continue
-                iid = issue.get("id")
-                if not iid:
-                    continue
-                new_rows.append(
-                    {
-                        "group_id": gid,
-                        "org_id": org_id,
-                        "project_id": project_id,
-                        "issue_id": str(iid),
-                        "status": STATUS_PENDING,
-                    }
+                print(
+                    f"  issue_type seen: {format_label_counts(match.issue_type_seen)}"
                 )
-    return new_rows
+                print(
+                    "  fixed_in_available seen: "
+                    f"{format_label_counts(match.fixed_in_available_seen)}"
+                )
+        new_rows.extend(match.state_rows)
+        report_rows.extend(match.report_rows)
+    return new_rows, report_rows
 
 
 def main() -> int:
@@ -756,10 +967,12 @@ def main() -> int:
     org_ids = env_extend_ids(args.org_id, "SNYK_ORG_ID", "SNYK_ORG_IDS")
 
     state_path = Path(args.state_csv).expanduser()
+    report_path = (
+        Path(args.report_csv).expanduser() if args.report_csv.strip() else None
+    )
     api_base, rest_base = resolve_snyk_api_bases(args.api_base_url)
     rest_version = args.rest_version.strip() or DEFAULT_REST_VERSION
     disregard = not args.no_disregard_if_fixable
-    require_not_partial = not args.include_partially_fixable
 
     project_filter: set[str] | None = None
     if args.project_filter:
@@ -782,39 +995,79 @@ def main() -> int:
             return 1
         if not args.quiet:
             print(f"Resume mode: loaded {len(rows)} row(s) from {state_path}")
+        if report_path is not None:
+            print(
+                "Warning: --report-csv is ignored with --resume (no export "
+                "runs, so there is nothing to report).",
+                file=sys.stderr,
+            )
     else:
         if not group_ids and not org_ids:
             print(
-                "Error: provide --group-id and/or --org-id for discovery, or use "
+                "Error: provide --group-id and/or --org-id to export, or use "
                 "--resume with an existing state CSV.",
                 file=sys.stderr,
             )
             return 1
-        org_to_group = build_org_to_group(api_base, group_ids, org_ids, token)
-        if not org_to_group:
-            print("Error: no organizations to scan.", file=sys.stderr)
-            return 1
-        if not args.quiet:
-            print(f"Discovering across {len(org_to_group)} org(s).")
 
-        discovered = discover_rows(
-            api_base=api_base,
-            rest_base=rest_base,
-            rest_version=rest_version,
-            org_to_group=org_to_group,
-            project_filter=project_filter,
-            token=token,
-            require_not_partial=require_not_partial,
-            quiet=args.quiet,
-            discover_projects=args.discover_projects,
-        )
+        try:
+            filters = build_date_filters(args)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        issue_statuses = label_set(args.issue_status, DEFAULT_ISSUE_STATUS)
+        if args.issue_status is not None:
+            status_values = [v.strip() for v in args.issue_status if v.strip()]
+        else:
+            status_values = [DEFAULT_ISSUE_STATUS]
+        if status_values:
+            filters["issue_status"] = status_values
+
+        scopes: list[tuple[str, str]] = []
+        for kind, ids in (("group", group_ids), ("org", org_ids)):
+            for scope_id in ids:
+                if (kind, scope_id) not in scopes:
+                    scopes.append((kind, scope_id))
+
+        if not args.quiet:
+            print(f"Exporting issues for {len(scopes)} scope(s).")
+
+        try:
+            discovered, report_rows = run_exports(
+                rest_base=rest_base,
+                rest_version=rest_version,
+                scopes=scopes,
+                filters=filters,
+                token=token,
+                fixability=label_set(args.fixability, DEFAULT_FIXABILITY),
+                issue_types=label_set(args.issue_type, DEFAULT_ISSUE_TYPE),
+                issue_statuses=issue_statuses,
+                project_filter=project_filter,
+                require_unfixed_upstream=not args.include_fixed_in_available,
+                poll_seconds=max(1, args.poll_seconds),
+                export_timeout=max(1, args.export_timeout),
+                quiet=args.quiet,
+            )
+        except RuntimeError as exc:
+            print(f"Export failed: {exc}", file=sys.stderr)
+            return 1
+
         rows = merge_pending_rows(rows, discovered)
         save_state_csv(state_path, rows)
         if not args.quiet:
             print(
                 f"State CSV updated: {state_path} "
-                f"({len(discovered)} candidate issue row(s) from discovery)."
+                f"({len(discovered)} candidate issue row(s) from the export)."
             )
+
+        if report_path is not None:
+            save_report_csv(report_path, report_rows)
+            if not args.quiet:
+                print(
+                    f"Report CSV written: {report_path} "
+                    f"({len(report_rows)} matched issue(s))."
+                )
 
     pending = [r for r in rows if r.get("status") == STATUS_PENDING]
     if not args.quiet:
@@ -852,11 +1105,14 @@ def main() -> int:
             save_state_csv(state_path, rows)
             if not args.quiet:
                 print(f"  ignored {issue_id}")
-        except RuntimeError as exc:
+        except SnykApiError as exc:
+            # Match on the status code, never on digits in the message: issue
+            # IDs such as SNYK-JS-NODESASS-540958 contain "409" and used to be
+            # misread as an existing-ignore conflict.
             err_text = str(exc).lower()
             if (
-                "already" in err_text
-                or "409" in err_text
+                exc.status == 409
+                or "already" in err_text
                 or "duplicate" in err_text
             ):
                 row["status"] = STATUS_IGNORED
@@ -867,6 +1123,9 @@ def main() -> int:
             else:
                 print(f"  Error ignoring {issue_id}: {exc}", file=sys.stderr)
                 return 1
+        except RuntimeError as exc:
+            print(f"  Error ignoring {issue_id}: {exc}", file=sys.stderr)
+            return 1
 
     if not args.quiet:
         print(

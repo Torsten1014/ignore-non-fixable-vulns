@@ -3,12 +3,19 @@ name: Snyk ignore non-fixable vulns
 on:
   # schedule:
     # Daily at 07:00 UTC (uncomment and adjust as needed).
+    # The Export API refreshes roughly every two hours and allows 20 export
+    # requests per hour, so do not schedule this more often than that.
     # - cron: "0 7 * * *"
   workflow_dispatch:
 
 concurrency:
   group: snyk-ignore-non-fixable
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required to list previous runs and download their artifacts.
+  actions: read
 
 jobs:
   run:
@@ -23,6 +30,12 @@ jobs:
       SNYK_ORG_IDS: ${{ vars.SNYK_ORG_IDS }}
       SNYK_GROUP_ID: ${{ vars.SNYK_GROUP_ID }}
       SNYK_GROUP_IDS: ${{ vars.SNYK_GROUP_IDS }}
+      SNYK_INTRODUCED_FROM: ${{ vars.SNYK_INTRODUCED_FROM }}
+      SNYK_INTRODUCED_TO: ${{ vars.SNYK_INTRODUCED_TO }}
+      SNYK_UPDATED_FROM: ${{ vars.SNYK_UPDATED_FROM }}
+      SNYK_UPDATED_TO: ${{ vars.SNYK_UPDATED_TO }}
+      STATE_CSV: ignore_non_fixable_progress.csv
+      REPORT_CSV: ignore_non_fixable_report.csv
 
     steps:
       - name: Checkout repository
@@ -33,41 +46,64 @@ jobs:
         with:
           python-version: "3.11"
 
+      # download-artifact only sees the current run unless given a run id, so
+      # find the most recent completed run of this workflow to restore from.
+      - name: Find previous run
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list \
+            --workflow ignore-non-fixable-vulns.yml \
+            --branch "${{ github.ref_name }}" \
+            --limit 20 \
+            --json databaseId,status \
+            --jq '[.[]
+                   | select(.status == "completed")
+                   | select(.databaseId != (env.CURRENT_RUN_ID | tonumber))]
+                  | .[0].databaseId // empty')"
+          printf 'run_id=%s\n' "${run_id:-}" >> "$GITHUB_OUTPUT"
+          if [ -n "${run_id:-}" ]; then
+            printf 'Restoring progress from run %s\n' "$run_id"
+          else
+            printf 'No previous run found; starting fresh.\n'
+          fi
+
+      # Absent or expired artifact is fine: the run just starts from scratch.
       - name: Restore progress CSV
+        if: steps.previous.outputs.run_id != ''
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: snyk-ignore-progress
-        continue-on-error: true
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ github.token }}
 
+      # Always export rather than --resume: the export path merges into the
+      # existing CSV (never downgrading IGNORED) and then processes every
+      # PENDING row, so it both picks up new issues and finishes any work a
+      # previous run left behind.
       # Org scope (default). Comment out this step if using the group step below.
       - name: Ignore non-fixable vulnerabilities (org)
         run: |
           set -euo pipefail
-          STATE_CSV="ignore_non_fixable_progress.csv"
-          if [ -f "$STATE_CSV" ]; then
-            python ignore_non_fixable_vulns.py --resume -s "$STATE_CSV"
-          else
-            ARGS=(-s "$STATE_CSV")
-            if [ -n "${SNYK_ORG_ID:-}" ]; then
-              ARGS+=(--org-id "$SNYK_ORG_ID")
-            fi
-            python ignore_non_fixable_vulns.py "${ARGS[@]}"
+          ARGS=(-s "$STATE_CSV" --report-csv "$REPORT_CSV")
+          if [ -n "${SNYK_ORG_ID:-}" ]; then
+            ARGS+=(--org-id "$SNYK_ORG_ID")
           fi
+          python ignore_non_fixable_vulns.py "${ARGS[@]}"
 
       # Group scope. Uncomment this step and comment out the org step above if needed.
       # - name: Ignore non-fixable vulnerabilities (group)
       #   run: |
       #     set -euo pipefail
-      #     STATE_CSV="ignore_non_fixable_progress.csv"
-      #     if [ -f "$STATE_CSV" ]; then
-      #       python ignore_non_fixable_vulns.py --resume -s "$STATE_CSV"
-      #     else
-      #       ARGS=(-s "$STATE_CSV")
-      #       if [ -n "${SNYK_GROUP_ID:-}" ]; then
-      #         ARGS+=(--group-id "$SNYK_GROUP_ID")
-      #       fi
-      #       python ignore_non_fixable_vulns.py "${ARGS[@]}"
+      #     ARGS=(-s "$STATE_CSV" --report-csv "$REPORT_CSV")
+      #     if [ -n "${SNYK_GROUP_ID:-}" ]; then
+      #       ARGS+=(--group-id "$SNYK_GROUP_ID")
       #     fi
+      #     python ignore_non_fixable_vulns.py "${ARGS[@]}"
 
       - name: Save progress CSV
         uses: actions/upload-artifact@v4
@@ -75,5 +111,15 @@ jobs:
         with:
           name: snyk-ignore-progress
           path: ignore_non_fixable_progress.csv
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # Run-scoped name so it is never restored into the workspace next run.
+      - name: Save report CSV
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-ignore-report-${{ github.run_id }}
+          path: ignore_non_fixable_report.csv
           retention-days: 90
           if-no-files-found: ignore
