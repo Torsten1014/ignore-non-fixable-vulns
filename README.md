@@ -27,6 +27,7 @@ Issues come from the **Export API** (`issues` dataset): the tool starts one CSV 
 | Fetch export results | REST `GET .../export/{export_id}` |
 | Download results | Pre-signed object-storage URL (no auth header) |
 | Create ignore | V1 `POST /org/{orgId}/project/{projectId}/ignore/{issueId}` |
+| Delete ignore (`--revert`) | V1 `DELETE /org/{orgId}/project/{projectId}/ignore/{issueId}` |
 
 Set **`SNYK_API_BASE_URL`** or **`--api-base-url`** for non-US tenants (host only, no path suffix).
 The script appends **`/v1`** or **`/rest`** as needed (e.g. `https://api.eu.snyk.io` or `api.eu.snyk.io`).
@@ -92,13 +93,13 @@ export SNYK_TOKEN="your-token"
 # export SNYK_API_BASE_URL="https://api.eu.snyk.io"
 ```
 
-Optional env aliases (comma-separated where noted):
+Optional env aliases:
 
-- `SNYK_GROUP_ID` / `SNYK_GROUP_IDS`
-- `SNYK_ORG_ID` / `SNYK_ORG_IDS`
 - `SNYK_INTRODUCED_FROM` / `SNYK_INTRODUCED_TO`
 - `SNYK_UPDATED_FROM` / `SNYK_UPDATED_TO`
 - `SNYK_REPORT_CSV`
+
+> **Scope is command line only.** `--group-id` and `--org-id` are the *only* way to set scope. `SNYK_GROUP_ID`, `SNYK_GROUP_IDS`, `SNYK_ORG_ID`, and `SNYK_ORG_IDS` are deliberately not read, and the script warns on stderr if it sees them. Earlier versions merged those variables on top of the CLI arguments, which meant a leftover `SNYK_GROUP_ID` silently turned an org-scoped run into a group-wide one. The scope of a run is now always visible in the command that started it.
 
 ## State CSV
 
@@ -214,11 +215,43 @@ python ignore_non_fixable_vulns.py --org-id "<ORG_UUID>" --include-fixed-in-avai
 python ignore_non_fixable_vulns.py --org-id "<ORG_UUID>" --reason "No fix available"
 ```
 
+## Reverting (`--revert`)
+
+`--revert` undoes a previous run. It reads the state CSV, deletes the ignore for every row marked `IGNORED` via `DELETE /v1/org/{orgId}/project/{projectId}/ignore/{issueId}`, and records progress in a **separate** CSV so the input is never modified.
+
+```sh
+# Preview first.
+python ignore_non_fixable_vulns.py --revert --dry-run \
+  -s ignore_non_fixable_progress.csv --unignore-csv unignore_progress.csv
+
+# Then for real.
+python ignore_non_fixable_vulns.py --revert \
+  -s ignore_non_fixable_progress.csv --unignore-csv unignore_progress.csv
+```
+
+Behavior worth knowing:
+
+- Only `IGNORED` rows are touched. A `PENDING` row was never ignored, so there is nothing to delete.
+- The unignore CSV has the same columns as the state CSV, with status `PENDING` then `UNIGNORED`. It is rewritten after every deletion, so an interrupted revert can simply be re-run and will skip what it already removed.
+- A `404` from the delete means the ignore is already gone. That is the desired end state, so the row is marked `UNIGNORED` rather than failing.
+- The V1 delete removes every path for that issue on that project, which matches how the ignores were created (`ignorePath: "*"`).
+- `--revert` cannot be combined with `--resume`, and rejects `--group-id` / `--org-id`, because the scope comes entirely from the CSV.
+- `--unignore-csv` defaults to `unignore_progress.csv` and can be set with `SNYK_UNIGNORE_CSV`.
+
 ## GitHub Actions
+
+Two workflows ship with the tool:
+
+| Workflow | Purpose |
+|----------|---------|
+| [`ignore-non-fixable-vulns.yml`](.github/workflows/ignore-non-fixable-vulns.yml) | Export, then create ignores. Manual or scheduled. |
+| [`revert-non-fixable-ignores.yml`](.github/workflows/revert-non-fixable-ignores.yml) | Delete ignores created by a previous run. Manual only. |
 
 A sample scheduled workflow lives at [`.github/workflows/ignore-non-fixable-vulns.yml`](.github/workflows/ignore-non-fixable-vulns.yml). It runs on manual dispatch (optional schedule), exports issues, creates ignores for the non-fixable ones, uploads a report of what matched, and persists progress between runs via a workflow artifact.
 
-The workflow defines two run steps — **org** (enabled by default) and **group** (commented out). Comment out the step you do not need; only one should be active.
+The workflow defines two run steps: **org** (enabled by default) and **group** (commented out). Comment out the step you do not need, and only one should be active.
+
+Each step reads only its own repository variables, inside that step's `env` block, and converts them into explicit `--org-id` / `--group-id` flags. Scope variables are deliberately **not** in the job-level `env`, because job-level variables apply to whichever step is uncommented, so a `SNYK_GROUP_ID` set there would widen an org-scoped run. Commenting a step out now genuinely disables that scope.
 
 ### Repository configuration
 
@@ -227,10 +260,10 @@ Set repository **secrets** and **variables** as needed. Unset or empty repositor
 | Name | Type | Required | Purpose |
 |------|------|----------|---------|
 | `SNYK_TOKEN` | Secret | Yes | Snyk API token with report-read and ignore permissions |
-| `SNYK_ORG_ID` | Variable | Yes* | Organization UUID (org step; also merged from env by the script) |
-| `SNYK_ORG_IDS` | Variable | No | Comma-separated org UUIDs |
-| `SNYK_GROUP_ID` | Variable | Yes† | Group UUID (group step; also merged from env by the script) |
-| `SNYK_GROUP_IDS` | Variable | No | Comma-separated group UUIDs |
+| `SNYK_ORG_ID` | Variable | Yes* | Organization UUID. Read by the **org step only** and passed as `--org-id` |
+| `SNYK_ORG_IDS` | Variable | No | Comma-separated org UUIDs, each passed as its own `--org-id` |
+| `SNYK_GROUP_ID` | Variable | Yes† | Group UUID. Read by the **group step only** and passed as `--group-id` |
+| `SNYK_GROUP_IDS` | Variable | No | Comma-separated group UUIDs, each passed as its own `--group-id` |
 | `SNYK_API_BASE_URL` | Variable | No | API host (e.g. `https://api.eu.snyk.io`); default US |
 | `SNYK_REST_VERSION` | Variable | No | REST version query param; default `2024-10-15` |
 | `SNYK_INTRODUCED_FROM` | Variable | No | Export date filter; default `2010-01-01T00:00:00Z` |
@@ -246,7 +279,7 @@ Set repository **secrets** and **variables** as needed. Unset or empty repositor
 
 1. **Find** the most recent completed run of this workflow on the same branch (`gh run list`), excluding the current one.
 2. **Restore** that run's `ignore_non_fixable_progress.csv` artifact. Missing or expired is fine — the run just starts from scratch.
-3. **Export** using the active step (org or group). Additional org/group IDs from `SNYK_ORG_IDS` / `SNYK_GROUP_IDS` are read from the environment automatically.
+3. **Export** using the active step (org or group). That step turns its own repository variables into explicit `--org-id` / `--group-id` flags, one per ID. If none are set the script exits with an error rather than doing nothing.
 4. **Create ignores** for each `PENDING` row (same as a local run without `--dry-run`).
 5. **Upload** the updated CSV as artifact `snyk-ignore-progress` (90-day retention) so the next run continues where it left off, and the report as `snyk-ignore-report-<run_id>`.
 
@@ -267,9 +300,28 @@ Restoring across runs needs `actions: read` permission plus `run-id` and `github
 
 Common edits:
 
-- **Group instead of org** — comment out the org step, uncomment the group step, set `SNYK_GROUP_ID` (and optionally `SNYK_GROUP_IDS`).
+- **Group instead of org** — comment out the org step, uncomment the group step, set `SNYK_GROUP_ID` (and optionally `SNYK_GROUP_IDS`). Leaving `SNYK_ORG_ID` set does no harm, because the commented-out step never reads it.
 - **Dry-run gate** — add `--dry-run` to the `python` command, then review the `snyk-ignore-report-<run_id>` artifact before enabling live ignores.
 - **Forget past work** — delete the `snyk-ignore-progress` artifact in the Actions UI. Every run exports regardless; this only clears the record of what was already ignored, so the next run re-attempts them all.
+
+### Revert workflow
+
+[`revert-non-fixable-ignores.yml`](.github/workflows/revert-non-fixable-ignores.yml) is **manual only** and reads its input from the repository rather than from an artifact, so what it will undo is reviewable in a diff before it runs.
+
+1. Download the `snyk-ignore-progress` artifact from the run you want to undo.
+2. Commit the CSV as [`data/ignore_non_fixable_progress.csv`](data/).
+3. Run **Actions → Snyk revert non-fixable ignores → Run workflow**.
+
+Inputs:
+
+| Input | Default | Purpose |
+|-------|---------|---------|
+| `dry_run` | `true` | Preview only. Uncheck to actually delete. |
+| `confirm` | empty | Must be exactly `revert` when `dry_run` is off, otherwise the job fails before touching anything. |
+
+The job prints how many `IGNORED` rows the CSV holds before doing anything, fails early if the CSV is missing, and uploads its results as `snyk-unignore-progress-<run_id>`. It shares the `snyk-ignore-non-fixable` concurrency group with the ignore workflow so a revert cannot race a run that is creating ignores.
+
+Because the revert writes to a separate file, the committed input CSV is never modified. Re-running is safe and only retries what is still outstanding.
 
 ## Notes
 

@@ -1,0 +1,83 @@
+name: Snyk revert non-fixable ignores
+
+# Destructive and manual only. Reads the committed progress CSV and deletes
+# every ignore it recorded as IGNORED.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only. Uncheck to actually delete the ignores."
+        type: boolean
+        default: true
+      confirm:
+        description: 'Type "revert" to confirm. Required when dry run is off.'
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  # Shared with the ignore workflow so a revert cannot race a run that is
+  # creating ignores.
+  group: snyk-ignore-non-fixable
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  revert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SNYK_API_BASE_URL: ${{ vars.SNYK_API_BASE_URL }}
+      SNYK_REST_VERSION: ${{ vars.SNYK_REST_VERSION }}
+      STATE_CSV: data/ignore_non_fixable_progress.csv
+      UNIGNORE_CSV: unignore_progress.csv
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check input
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$STATE_CSV" ]; then
+            printf 'No %s in the repository. Commit the progress CSV you want to revert.\n' "$STATE_CSV" >&2
+            exit 1
+          fi
+          count="$(grep -c ',IGNORED$' "$STATE_CSV" || true)"
+          printf '%s contains %s IGNORED row(s).\n' "$STATE_CSV" "$count"
+          if [ "$DRY_RUN" != "true" ] && [ "$CONFIRM" != "revert" ]; then
+            printf 'Refusing to delete: set the confirm input to "revert".\n' >&2
+            exit 1
+          fi
+
+      - name: Revert ignores
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ARGS=(--revert -s "$STATE_CSV" --unignore-csv "$UNIGNORE_CSV")
+          if [ "$DRY_RUN" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python ignore_non_fixable_vulns.py "${ARGS[@]}"
+
+      - name: Save unignore CSV
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-unignore-progress-${{ github.run_id }}
+          path: unignore_progress.csv
+          retention-days: 90
+          if-no-files-found: ignore

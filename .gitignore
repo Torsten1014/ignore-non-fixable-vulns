@@ -8,7 +8,10 @@ htmlcov/
 # create_issues_table: generated output (may contain sensitive issue data)
 create_issues_table/*.csv
 
-# ignore_non_fixable_vulns: state CSV (org/project/issue IDs) and the
-# --report-csv output (issue titles, packages, project names)
+# ignore_non_fixable_vulns: state CSV (org/project/issue IDs), the
+# --report-csv output (issue titles, packages, project names) and the
+# --revert progress file. data/ is deliberately NOT ignored: the revert
+# workflow reads its input CSV from the checkout.
 /ignore_non_fixable_progress.csv
 /ignore_non_fixable_report.csv
+/unignore_progress.csv

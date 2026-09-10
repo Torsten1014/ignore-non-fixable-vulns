@@ -29,6 +29,11 @@ Revision History:
 - 2026-09-09: Also require fixed_in_available to be false, so the selection
   matches what disregardIfFixable treats as unfixable; classify ignore
   conflicts by HTTP status instead of substring-matching "409".
+- 2026-09-10: Scope comes only from --group-id / --org-id. SNYK_GROUP_ID(S)
+  and SNYK_ORG_ID(S) are no longer merged in, because a stray group variable
+  silently turned an org-scoped run into a group-wide one.
+- 2026-09-10: Add --revert to delete previously created ignores, driven by the
+  state CSV and tracked in a separate unignore CSV.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ DEFAULT_API_HOST = "https://api.snyk.io"
 DEFAULT_REST_VERSION = "2024-10-15"
 DEFAULT_REASON = "No fix available"
 DEFAULT_STATE_CSV = "ignore_non_fixable_progress.csv"
+DEFAULT_UNIGNORE_CSV = "unignore_progress.csv"
 
 # The Export API requires at least one date filter; this default is early
 # enough to cover every issue Snyk holds.
@@ -89,11 +95,21 @@ EXPORT_COLUMNS = (
 TRUTHY_LABELS = frozenset({"true", "yes", "1"})
 FALSEY_LABELS = frozenset({"false", "no", "0"})
 
+# Deliberately not read. Kept only so a run can warn when they are set, since
+# they used to widen scope invisibly.
+SCOPE_ENV_VARS = (
+    "SNYK_GROUP_ID",
+    "SNYK_GROUP_IDS",
+    "SNYK_ORG_ID",
+    "SNYK_ORG_IDS",
+)
+
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 CSV_COLUMNS = ("group_id", "org_id", "project_id", "issue_id", "status")
 STATUS_PENDING = "PENDING"
 STATUS_IGNORED = "IGNORED"
+STATUS_UNIGNORED = "UNIGNORED"
 
 # Kept separate from CSV_COLUMNS: load_state_csv validates the state header
 # exactly, so widening that file would reject every existing progress CSV.
@@ -536,6 +552,23 @@ def add_ignore(
     return request_json("POST", url, token, payload)
 
 
+def delete_ignore(
+    api_base: str,
+    org_id: str,
+    project_id: str,
+    issue_id: str,
+    token: str,
+) -> Any:
+    """
+    Remove every ignore rule for one issue on one project.
+
+    The V1 endpoint deletes all paths for the issue, which matches how
+    ``add_ignore`` creates them with ``ignorePath: "*"``.
+    """
+    url = f"{api_base}/org/{org_id}/project/{project_id}/ignore/{issue_id}"
+    return request_json("DELETE", url, token, None)
+
+
 def row_key(row: dict[str, str]) -> tuple[str, str, str]:
     """Stable tuple for de-duplication."""
     return (row["org_id"], row["project_id"], row["issue_id"])
@@ -625,14 +658,20 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="UUID",
-        help="Snyk Group ID (repeatable). One group-scoped export per ID.",
+        help=(
+            "Snyk Group ID (repeatable). One group-scoped export per ID. "
+            "Command line only: SNYK_GROUP_ID(S) is not read."
+        ),
     )
     parser.add_argument(
         "--org-id",
         action="append",
         default=[],
         metavar="UUID",
-        help="Snyk Organization ID (repeatable). One org-scoped export per ID.",
+        help=(
+            "Snyk Organization ID (repeatable). One org-scoped export per ID. "
+            "Command line only: SNYK_ORG_ID(S) is not read."
+        ),
     )
     parser.add_argument(
         "--project-id",
@@ -658,6 +697,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "CSV path for queue/resume (default: %(default)s in the current "
             "working directory)."
+        ),
+    )
+    parser.add_argument(
+        "--revert",
+        action="store_true",
+        help=(
+            "Undo mode. Read the state CSV and DELETE every ignore recorded "
+            "as IGNORED, tracking progress in --unignore-csv. Runs no export "
+            "and creates no ignores. Cannot be combined with --resume."
+        ),
+    )
+    parser.add_argument(
+        "--unignore-csv",
+        default=env_or_default("SNYK_UNIGNORE_CSV", DEFAULT_UNIGNORE_CSV),
+        metavar="PATH",
+        help=(
+            "Where --revert records its progress (default: %(default)s). Same "
+            "columns as the state CSV, with status UNIGNORED once removed, so "
+            "an interrupted revert can be re-run safely."
         ),
     )
     parser.add_argument(
@@ -814,14 +872,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def env_extend_ids(cli_list: list[str], env_single: str, env_plural: str) -> list[str]:
-    """Append UUIDs from comma-separated env vars."""
-    out = list(cli_list)
-    for key in (env_single, env_plural):
-        raw = os.environ.get(key, "").strip()
-        if raw:
-            out.extend(p.strip() for p in raw.split(",") if p.strip())
-    return out
+def warn_ignored_scope_env() -> None:
+    """
+    Warn that scope environment variables are no longer honoured.
+
+    These used to be merged on top of ``--group-id`` / ``--org-id``, which
+    meant a stray ``SNYK_GROUP_ID`` silently added a group-wide export to a
+    run that looked org-scoped. Scope now comes only from the command line.
+    """
+    present = [name for name in SCOPE_ENV_VARS if os.environ.get(name, "").strip()]
+    if not present:
+        return
+    print(
+        f"Warning: ignoring {', '.join(present)}. Scope must be given with "
+        "--group-id / --org-id so the run's scope is visible in the command.",
+        file=sys.stderr,
+    )
 
 
 def label_set(
@@ -955,6 +1021,135 @@ def run_exports(
     return new_rows, report_rows
 
 
+def build_revert_queue(
+    ignored_rows: list[dict[str, str]],
+    existing: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """
+    Build the unignore queue, preserving rows already marked UNIGNORED.
+
+    Mirrors merge_pending_rows but in the opposite direction: a row that has
+    already been reverted must never drop back to PENDING on a re-run.
+    """
+    done = {
+        row_key(row)
+        for row in existing
+        if row.get("status") == STATUS_UNIGNORED
+    }
+    queue: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in ignored_rows:
+        key = row_key(row)
+        if key in queue:
+            continue
+        queue[key] = {
+            "group_id": row.get("group_id", ""),
+            "org_id": row["org_id"],
+            "project_id": row["project_id"],
+            "issue_id": row["issue_id"],
+            "status": STATUS_UNIGNORED if key in done else STATUS_PENDING,
+        }
+    return list(queue.values())
+
+
+def run_revert(
+    *,
+    api_base: str,
+    state_path: Path,
+    unignore_path: Path,
+    token: str,
+    dry_run: bool,
+    quiet: bool,
+) -> int:
+    """Delete the ignores recorded in the state CSV, tracking progress separately."""
+    if not state_path.is_file():
+        print(
+            f"Error: --revert needs an existing state CSV (looked for {state_path}).",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        state_rows = load_state_csv(state_path)
+    except ValueError as exc:
+        print(f"Error reading state CSV: {exc}", file=sys.stderr)
+        return 1
+
+    ignored_rows = [r for r in state_rows if r.get("status") == STATUS_IGNORED]
+    if not ignored_rows:
+        print(
+            f"Nothing to revert: no {STATUS_IGNORED} rows in {state_path}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    existing: list[dict[str, str]] = []
+    if unignore_path.is_file():
+        try:
+            existing = load_state_csv(unignore_path)
+        except ValueError as exc:
+            print(f"Error reading unignore CSV: {exc}", file=sys.stderr)
+            return 1
+
+    rows = build_revert_queue(ignored_rows, existing)
+    save_state_csv(unignore_path, rows)
+    pending = [r for r in rows if r.get("status") == STATUS_PENDING]
+    if not quiet:
+        print(
+            f"Reverting ignores from {state_path}: {len(ignored_rows)} "
+            f"{STATUS_IGNORED} row(s), {len(pending)} still to remove."
+        )
+        print(f"Unignore CSV: {unignore_path}")
+
+    removed = 0
+    already_gone = 0
+    for row in pending:
+        org_id = row["org_id"]
+        project_id = row["project_id"]
+        issue_id = row["issue_id"]
+
+        if dry_run:
+            if not quiet:
+                print(
+                    f"  [dry-run] would delete ignore {issue_id} "
+                    f"({org_id}/{project_id})"
+                )
+            removed += 1
+            continue
+
+        try:
+            delete_ignore(api_base, org_id, project_id, issue_id, token)
+            row["status"] = STATUS_UNIGNORED
+            removed += 1
+            save_state_csv(unignore_path, rows)
+            if not quiet:
+                print(f"  unignored {issue_id}")
+        except SnykApiError as exc:
+            # Nothing there to delete is the desired end state, so treat it as
+            # done rather than failing a re-run.
+            if exc.status == 404:
+                row["status"] = STATUS_UNIGNORED
+                already_gone += 1
+                save_state_csv(unignore_path, rows)
+                if not quiet:
+                    print(
+                        f"  skip {issue_id} (no ignore found): {exc}",
+                        file=sys.stderr,
+                    )
+            else:
+                print(f"  Error unignoring {issue_id}: {exc}", file=sys.stderr)
+                return 1
+        except RuntimeError as exc:
+            print(f"  Error unignoring {issue_id}: {exc}", file=sys.stderr)
+            return 1
+
+    if not quiet:
+        print(
+            f"Done. Ignores removed: {removed}; "
+            f"already absent: {already_gone}. "
+            f"Unignore file: {unignore_path}"
+        )
+    return 0
+
+
 def main() -> int:
     """Entry point."""
     args = parse_args()
@@ -963,8 +1158,9 @@ def main() -> int:
         print("Error: SNYK_TOKEN environment variable is not set.", file=sys.stderr)
         return 1
 
-    group_ids = env_extend_ids(args.group_id, "SNYK_GROUP_ID", "SNYK_GROUP_IDS")
-    org_ids = env_extend_ids(args.org_id, "SNYK_ORG_ID", "SNYK_ORG_IDS")
+    warn_ignored_scope_env()
+    group_ids = list(args.group_id)
+    org_ids = list(args.org_id)
 
     state_path = Path(args.state_csv).expanduser()
     report_path = (
@@ -973,6 +1169,29 @@ def main() -> int:
     api_base, rest_base = resolve_snyk_api_bases(args.api_base_url)
     rest_version = args.rest_version.strip() or DEFAULT_REST_VERSION
     disregard = not args.no_disregard_if_fixable
+
+    if args.revert:
+        if args.resume:
+            print(
+                "Error: --revert and --resume are mutually exclusive.",
+                file=sys.stderr,
+            )
+            return 1
+        if group_ids or org_ids:
+            print(
+                "Error: --revert works from the state CSV, so --group-id and "
+                "--org-id are not accepted.",
+                file=sys.stderr,
+            )
+            return 1
+        return run_revert(
+            api_base=api_base,
+            state_path=state_path,
+            unignore_path=Path(args.unignore_csv).expanduser(),
+            token=token,
+            dry_run=args.dry_run,
+            quiet=args.quiet,
+        )
 
     project_filter: set[str] | None = None
     if args.project_filter:

@@ -22,14 +22,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    # Scope is deliberately absent here. SNYK_ORG_ID(S) / SNYK_GROUP_ID(S) at
+    # job level would apply to whichever step is uncommented, so a group
+    # variable would widen an org-scoped run. Each step reads only its own
+    # variables below and turns them into explicit --org-id / --group-id flags.
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
       SNYK_API_BASE_URL: ${{ vars.SNYK_API_BASE_URL }}
       SNYK_REST_VERSION: ${{ vars.SNYK_REST_VERSION }}
-      SNYK_ORG_ID: ${{ vars.SNYK_ORG_ID }}
-      SNYK_ORG_IDS: ${{ vars.SNYK_ORG_IDS }}
-      SNYK_GROUP_ID: ${{ vars.SNYK_GROUP_ID }}
-      SNYK_GROUP_IDS: ${{ vars.SNYK_GROUP_IDS }}
       SNYK_INTRODUCED_FROM: ${{ vars.SNYK_INTRODUCED_FROM }}
       SNYK_INTRODUCED_TO: ${{ vars.SNYK_INTRODUCED_TO }}
       SNYK_UPDATED_FROM: ${{ vars.SNYK_UPDATED_FROM }}
@@ -86,23 +86,42 @@ jobs:
       # PENDING row, so it both picks up new issues and finishes any work a
       # previous run left behind.
       # Org scope (default). Comment out this step if using the group step below.
+      # Reads SNYK_ORG_ID and SNYK_ORG_IDS only, so commenting this step out
+      # genuinely stops any org-scoped export.
       - name: Ignore non-fixable vulnerabilities (org)
+        env:
+          ID_LIST: "${{ vars.SNYK_ORG_ID }},${{ vars.SNYK_ORG_IDS }}"
         run: |
           set -euo pipefail
           ARGS=(-s "$STATE_CSV" --report-csv "$REPORT_CSV")
-          if [ -n "${SNYK_ORG_ID:-}" ]; then
-            ARGS+=(--org-id "$SNYK_ORG_ID")
-          fi
+          # The ${ids[@]+...} guard keeps an empty ID_LIST from tripping set -u.
+          ids=()
+          IFS=',' read -ra ids <<< "$ID_LIST" || true
+          for id in ${ids[@]+"${ids[@]}"}; do
+            id="${id//[[:space:]]/}"
+            if [ -n "$id" ]; then
+              ARGS+=(--org-id "$id")
+            fi
+          done
+          # No scope flags means the script exits with a clear error rather
+          # than quietly doing nothing.
           python ignore_non_fixable_vulns.py "${ARGS[@]}"
 
       # Group scope. Uncomment this step and comment out the org step above if needed.
       # - name: Ignore non-fixable vulnerabilities (group)
+      #   env:
+      #     ID_LIST: "${{ vars.SNYK_GROUP_ID }},${{ vars.SNYK_GROUP_IDS }}"
       #   run: |
       #     set -euo pipefail
       #     ARGS=(-s "$STATE_CSV" --report-csv "$REPORT_CSV")
-      #     if [ -n "${SNYK_GROUP_ID:-}" ]; then
-      #       ARGS+=(--group-id "$SNYK_GROUP_ID")
-      #     fi
+      #     ids=()
+      #     IFS=',' read -ra ids <<< "$ID_LIST" || true
+      #     for id in ${ids[@]+"${ids[@]}"}; do
+      #       id="${id//[[:space:]]/}"
+      #       if [ -n "$id" ]; then
+      #         ARGS+=(--group-id "$id")
+      #       fi
+      #     done
       #     python ignore_non_fixable_vulns.py "${ARGS[@]}"
 
       - name: Save progress CSV
